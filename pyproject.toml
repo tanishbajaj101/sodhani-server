@@ -6,4 +6,6 @@ dependencies = [
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.29.0",
     "requests>=2.31.0",
+    "apscheduler>=3.10.0",
+    "beautifulsoup4>=4.12.0",
 ]

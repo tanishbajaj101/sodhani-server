@@ -36,30 +36,52 @@ HEADERS = {
 
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
+
+    # Migrate from old schema if needed (drop old table, recreate with new columns)
+    cursor = conn.execute("PRAGMA table_info(announcements)")
+    existing = {row[1] for row in cursor.fetchall()}
+    if existing and "categoryname" not in existing:
+        conn.execute("DROP TABLE announcements")
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS announcements (
-            newsid     TEXT PRIMARY KEY,
-            scrip_cd   TEXT,
-            news_dt    TEXT,
-            raw_json   TEXT,
-            fetched_at TEXT
+            newsid            TEXT PRIMARY KEY,
+            scrip_cd          TEXT,
+            news_dt           TEXT,
+            newssub           TEXT,
+            headline          TEXT,
+            slongname         TEXT,
+            announcement_type TEXT,
+            attachmentname    TEXT,
+            categoryname      TEXT
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_scrip_cd ON announcements(scrip_cd)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_news_dt ON announcements(news_dt)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_categoryname ON announcements(categoryname)")
     conn.commit()
     return conn
 
 
 def insert_record(conn: sqlite3.Connection, record: dict) -> None:
+    scrip_cd = record.get("SCRIP_CD")
+    if scrip_cd is not None:
+        scrip_cd = str(scrip_cd)
+
     conn.execute(
-        "INSERT OR IGNORE INTO announcements (newsid, scrip_cd, news_dt, raw_json, fetched_at) VALUES (?, ?, ?, ?, ?)",
+        """INSERT OR IGNORE INTO announcements
+           (newsid, scrip_cd, news_dt, newssub, headline, slongname, announcement_type, attachmentname, categoryname)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             record.get("NEWSID"),
-            record.get("SCRIP_CD"),
+            scrip_cd,
             record.get("NEWS_DT"),
-            json.dumps(record, ensure_ascii=False),
-            datetime.utcnow().isoformat(),
+            record.get("NEWSSUB"),
+            record.get("HEADLINE"),
+            record.get("SLONGNAME"),
+            record.get("ANNOUNCEMENT_TYPE"),
+            record.get("ATTACHMENTNAME"),
+            record.get("CATEGORYNAME"),
         ),
     )
 
@@ -160,26 +182,32 @@ def update(
 
 # ── Query Helper ────────────────────────────────────────────────────────────────
 
+def _row_to_dict(row: sqlite3.Row) -> dict:
+    return dict(row)
+
+
 def get_by_scrip(scrip_cd: str) -> list[dict]:
     """Return all announcements for a given BSE security code (newest first)."""
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT raw_json FROM announcements WHERE scrip_cd = ? ORDER BY news_dt DESC",
+        "SELECT * FROM announcements WHERE scrip_cd = ? ORDER BY news_dt DESC",
         (scrip_cd,),
     ).fetchall()
     conn.close()
-    return [json.loads(r[0]) for r in rows]
+    return [_row_to_dict(r) for r in rows]
 
 
 def get_recent(limit: int = 20) -> list[dict]:
     """Return the most recently-fetched announcements."""
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT raw_json FROM announcements ORDER BY fetched_at DESC LIMIT ?",
+        "SELECT * FROM announcements ORDER BY news_dt DESC LIMIT ?",
         (limit,),
     ).fetchall()
     conn.close()
-    return [json.loads(r[0]) for r in rows]
+    return [_row_to_dict(r) for r in rows]
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────────
