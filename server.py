@@ -7,6 +7,7 @@ import sqlite3
 from datetime import datetime, timedelta, time
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -17,10 +18,12 @@ from get_business_standard_response import build_reports_payload
 
 # ── Paths ────────────────────────────────────────────────────────────────────────
 
-DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get("DATA_DIR", APP_DIR)
 DB_PATH = os.path.join(DATA_DIR, "bse_announcements.db")
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
-OUTPUT_CONSOLIDATED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output_consolidated")
+OUTPUT_BASE_DIR = os.environ.get("OUTPUT_BASE_DIR") or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or APP_DIR
+OUTPUT_DIR = os.path.join(OUTPUT_BASE_DIR, "output")
+OUTPUT_CONSOLIDATED_DIR = os.path.join(OUTPUT_BASE_DIR, "output_consolidated")
 RESEARCH_REPORT_CACHE_TTL_SECONDS = int(os.environ.get("RESEARCH_REPORT_CACHE_TTL_SECONDS", "21600"))
 _research_reports_cache: dict[tuple[int], tuple[datetime, dict]] = {}
 
@@ -60,9 +63,6 @@ def init_db() -> None:
 
 scheduler = BackgroundScheduler()
 
-# BSE Market hours: 9:15 AM - 3:30 PM IST
-# Converted to UTC: 3:45 AM - 10:00 AM UTC (IST = UTC+5:30)
-
 def scheduled_fetch():
     """Background job to fetch announcements."""
     today = datetime.today().strftime("%Y%m%d")
@@ -80,30 +80,17 @@ app = FastAPI(title="BSE Announcements API")
 @app.on_event("startup")
 def on_startup():
     init_db()
-    
-    # Cron schedule: Only run during BSE market hours (9:15 AM - 3:30 PM IST = 3:45-10:00 UTC)
-    # Every 5 minutes: at :00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55
+
+    # Fetch every 15 hours, regardless of market hours (reduced from 5-min market-hours cron to cut server cost).
     scheduler.add_job(
         scheduled_fetch,
-        "cron",
-        hour="3-9",      # 3:45 AM UTC to 9:55 AM UTC
-        minute="45-59/5,*/5",  # 3:45, 3:50, 3:55, then every 5 min until 9:55
-        id="fetch_morning",
+        IntervalTrigger(hours=15),
+        id="fetch_periodic",
         replace_existing=True,
     )
-    # 10:00 AM UTC (3:30 PM IST exactly)
-    scheduler.add_job(
-        scheduled_fetch,
-        "cron",
-        hour="10",
-        minute="0",
-        id="fetch_close",
-        replace_existing=True,
-    )
-    
+
     scheduler.start()
-    print("[Startup] Scheduler started - fetching every 5 minutes during market hours ONLY (9:15 AM - 3:30 PM IST)")
-    print("[Startup] Zero compute outside market hours")
+    print("[Startup] Scheduler started - fetching every 15 hours")
     # Initial fetch
     scheduled_fetch()
 
@@ -231,14 +218,20 @@ def _equity_file_response(file_name: str, output_dir: str) -> FileResponse:
     return FileResponse(file_path, media_type="application/json")
 
 
-@app.get("/equity/{file_name}/consolidated")
-def equity_consolidated_json(file_name: str):
-    return _equity_file_response(file_name, OUTPUT_CONSOLIDATED_DIR)
+def _equity_output_dir(consolidated: bool) -> str:
+    output_dir = OUTPUT_CONSOLIDATED_DIR if consolidated else OUTPUT_DIR
+    nested_dir = os.path.join(output_dir, os.path.basename(output_dir))
+    if os.path.isdir(nested_dir):
+        return nested_dir
+    return output_dir
 
 
-@app.get("/equity/{file_name}")
-def equity_json(file_name: str):
-    return _equity_file_response(file_name, OUTPUT_DIR)
+@app.get("/api/equity")
+def equity_json_by_code(
+    code: str = Query(..., min_length=1),
+    consolidated: bool = Query(default=False),
+):
+    return _equity_file_response(code, _equity_output_dir(consolidated))
 
 
 @app.post("/admin/fetch")

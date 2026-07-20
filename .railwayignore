@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+output/
+output_consolidated/
+
+.git/
+.env
+.venv/
+venv/
+
+*.log
