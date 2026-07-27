@@ -4,6 +4,7 @@ BSE Announcements & Equity API server with User Authentication.
 
 import json
 import os
+import re
 import sqlite3
 import urllib.parse
 import urllib.request
@@ -106,10 +107,16 @@ _research_reports_cache: dict[tuple[int], tuple[datetime, dict]] = {}
 
 # ── DB Init ─────────────────────────────────────────────────────────────────────
 
+def get_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    return conn
+
 def init_db() -> None:
     """Ensure the announcements and users tables exist."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
 
     # Migrate from old schema if needed
     cursor = conn.execute("PRAGMA table_info(announcements)")
@@ -162,10 +169,14 @@ def init_db() -> None:
 
 _otp_req_ids: dict[str, str] = {}
 
-def send_msg91_otp(mobile: str) -> bool:
-    clean_mobile = mobile.replace("+", "").strip()
-    if len(clean_mobile) == 10:
-        clean_mobile = "91" + clean_mobile
+def normalize_phone(phone: str) -> str:
+    clean = re.sub(r"\D", "", phone or "")
+    if len(clean) == 10:
+        return "91" + clean
+    return clean
+
+def send_msg91_otp(mobile: str) -> tuple[bool, str | None, str | None]:
+    clean_mobile = normalize_phone(mobile)
 
     widget_id = os.environ.get("MSG91_WIDGET_ID") or MSG91_TEMPLATE_ID
     token_auth = os.environ.get("MSG91_TOKEN_AUTH") or MSG91_AUTH_KEY
@@ -173,10 +184,10 @@ def send_msg91_otp(mobile: str) -> bool:
     print(f"[MSG91 Widget Debug] Sending OTP to {clean_mobile} using WidgetID '{widget_id}'")
 
     if not token_auth or not widget_id:
-        print(f"[MSG91 Dev Mock] Missing credentials in .env! Sent mock OTP '123456' to {clean_mobile}")
-        return True
+        print("[MSG91 Error] Missing MSG91_WIDGET_ID or MSG91_TOKEN_AUTH in .env!")
+        return False, None, "MSG91 credentials missing in server .env file."
 
-    # 1. Primary: Call MSG91 Widget sendOtp API (No DLT registration required!)
+    # Call MSG91 Widget sendOtp API
     url = "https://control.msg91.com/api/v5/widget/sendOtp"
     payload = json.dumps({
         "widgetId": widget_id,
@@ -194,26 +205,31 @@ def send_msg91_otp(mobile: str) -> bool:
             data = json.loads(resp.read().decode())
             print(f"[MSG91 Widget Response] {data}")
             if data.get("type") == "success" or data.get("status") == "success":
-                req_id = data.get("message")
-                if req_id and isinstance(req_id, str):
+                req_id = data.get("message") if isinstance(data.get("message"), str) else None
+                if req_id:
                     _otp_req_ids[clean_mobile] = req_id
-                    print(f"[MSG91 Widget] Stored reqId '{req_id}' for {clean_mobile}")
-                return True
-            if data.get("message") == "Invalid Captcha Token.":
+                return True, req_id, None
+            
+            err_msg = data.get("message") or "Failed to send OTP"
+            if err_msg == "Invalid Captcha Token.":
                 print("[MSG91 ACTION REQUIRED] Please turn Captcha OFF in MSG91 Dashboard -> OTP -> Widgets -> Widget Settings!")
-            return False
+                err_msg = "MSG91 Widget Captcha is enabled. Turn Captcha OFF in MSG91 Widget Settings."
+            elif data.get("code") == "408" or err_msg == "IPBlocked":
+                print("[MSG91 ACTION REQUIRED] MSG91 blocked this IP! Disable IP Restriction or whitelist your IP in MSG91 Dashboard.")
+                err_msg = "MSG91 IP Restriction active. Please whitelist server IP in MSG91 Dashboard."
+            return False, None, err_msg
     except urllib.error.HTTPError as e:
         err_body = e.read().decode()
         print(f"[MSG91 Widget HTTP Error {e.code}] {err_body}")
-        return False
+        return False, None, f"HTTP {e.code}: Failed to send OTP"
     except Exception as e:
         print(f"[MSG91 Widget Error] {e}")
-        return False
+        return False, None, str(e)
 
 def verify_msg91_widget_access_token(access_token: str) -> bool:
-    if access_token == "dev_mock_token" or not MSG91_AUTH_KEY:
-        print("[MSG91 Dev Mock] Access Token verified")
-        return True
+    if not MSG91_AUTH_KEY:
+        print("[MSG91 Error] Missing MSG91_AUTH_KEY in .env!")
+        return False
 
     url = "https://control.msg91.com/api/v5/widget/verifyAccessToken"
     payload = json.dumps({
@@ -239,20 +255,18 @@ def verify_msg91_widget_access_token(access_token: str) -> bool:
         print(f"[MSG91 verifyAccessToken Error] {e}")
         return False
 
-def verify_msg91_otp(mobile: str, otp: str) -> bool:
-    clean_mobile = mobile.replace("+", "").strip()
-    if len(clean_mobile) == 10:
-        clean_mobile = "91" + clean_mobile
+def verify_msg91_otp(mobile: str, otp: str, req_id: str | None = None) -> bool:
+    clean_mobile = normalize_phone(mobile)
 
     widget_id = os.environ.get("MSG91_WIDGET_ID") or MSG91_TEMPLATE_ID
     token_auth = os.environ.get("MSG91_TOKEN_AUTH") or MSG91_AUTH_KEY
     auth_key = MSG91_AUTH_KEY or token_auth
 
-    if otp == "123456" or not auth_key:
-        print(f"[MSG91 Dev Mock] OTP {otp} verified for {clean_mobile}")
-        return True
+    if not auth_key and not (widget_id and token_auth):
+        print("[MSG91 Error] No Auth Key or Widget credentials configured in .env!")
+        return False
 
-    req_id = _otp_req_ids.get(clean_mobile)
+    active_req_id = req_id or _otp_req_ids.get(clean_mobile)
 
     # 1. Try Widget Verify API with reqId
     if widget_id and token_auth:
@@ -263,8 +277,8 @@ def verify_msg91_otp(mobile: str, otp: str) -> bool:
             "identifier": clean_mobile,
             "otp": otp
         }
-        if req_id:
-            body_dict["reqId"] = req_id
+        if active_req_id:
+            body_dict["reqId"] = active_req_id
 
         payload = json.dumps(body_dict).encode("utf-8")
         req = urllib.request.Request(
@@ -277,7 +291,16 @@ def verify_msg91_otp(mobile: str, otp: str) -> bool:
             with urllib.request.urlopen(req) as resp:
                 data = json.loads(resp.read().decode())
                 print(f"[MSG91 Widget Verify Response] {data}")
-                if data.get("type") == "success" or data.get("status") == "success" or "success" in str(data.get("message")).lower():
+                msg_str = str(data.get("message", "")).lower()
+                is_success = (
+                    data.get("type") == "success"
+                    or data.get("status") == "success"
+                    or "success" in msg_str
+                    or "already verif" in msg_str
+                    or data.get("code") == 703
+                    or str(data.get("code")) == "703"
+                )
+                if is_success:
                     return True
         except urllib.error.HTTPError as e:
             err_body = e.read().decode()
@@ -292,7 +315,16 @@ def verify_msg91_otp(mobile: str, otp: str) -> bool:
         with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read().decode())
             print(f"[MSG91 Verify Response] {data}")
-            return data.get("type") == "success" or data.get("status") == "success" or "success" in str(data.get("message")).lower()
+            msg_str = str(data.get("message", "")).lower()
+            is_success = (
+                data.get("type") == "success"
+                or data.get("status") == "success"
+                or "success" in msg_str
+                or "already verif" in msg_str
+                or data.get("code") == 703
+                or str(data.get("code")) == "703"
+            )
+            return is_success
     except urllib.error.HTTPError as e:
         err_body = e.read().decode()
         print(f"[MSG91 Verify HTTP Error {e.code}] {err_body}")
@@ -338,9 +370,22 @@ def on_startup():
 def on_shutdown():
     scheduler.shutdown()
 
+frontend_url = os.environ.get("FRONTEND_URL", "").strip()
+allowed_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+if frontend_url:
+    allowed_origins.append(frontend_url)
+    if frontend_url.endswith("/"):
+        allowed_origins.append(frontend_url[:-1])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins if frontend_url else ["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -355,6 +400,7 @@ class VerifySignupRequest(BaseModel):
     phone_number: str
     otp: str | None = None
     access_token: str | None = None
+    req_id: str | None = None
     name: str
     age: int
     email: str | None = None
@@ -363,6 +409,7 @@ class VerifyLoginRequest(BaseModel):
     phone_number: str
     otp: str | None = None
     access_token: str | None = None
+    req_id: str | None = None
 
 class GoogleAuthRequest(BaseModel):
     credential: str
@@ -391,7 +438,7 @@ class ResearchReportsResponse(BaseModel):
 # ── Helpers ──────────────────────────────────────────────────────────────────────
 
 def _query(scrip_cd: str, limit: int, offset: int) -> tuple[list[dict], int]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     conn.row_factory = sqlite3.Row
 
     total = conn.execute(
@@ -435,14 +482,15 @@ def send_otp(body: SendOtpRequest):
     if not phone or len(phone) < 10:
         raise HTTPException(status_code=400, detail="Please enter a valid phone number")
 
-    clean_phone = phone.replace("+", "").strip()
-    if len(clean_phone) == 10:
-        clean_phone = "91" + clean_phone
+    clean_phone = normalize_phone(phone)
 
     # Check database before sending OTP to save SMS costs and provide instant feedback
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     conn.row_factory = sqlite3.Row
-    existing = conn.execute("SELECT id FROM users WHERE phone_number = ? OR phone_number = ?", (phone, clean_phone)).fetchone()
+    existing = conn.execute(
+        "SELECT id FROM users WHERE phone_number = ? OR phone_number = ?", 
+        (phone, clean_phone)
+    ).fetchone()
     conn.close()
 
     if flow == "login" and not existing:
@@ -457,16 +505,18 @@ def send_otp(body: SendOtpRequest):
             detail="An account with this phone number already exists. Please log in instead."
         )
 
-    success = send_msg91_otp(phone)
+    success, req_id, err_msg = send_msg91_otp(clean_phone)
     if not success:
-        raise HTTPException(status_code=400, detail="Failed to send OTP. Please check the phone number.")
-    return {"message": "OTP sent successfully"}
+        raise HTTPException(status_code=400, detail=err_msg or "Failed to send OTP. Please check the phone number.")
+    return {"message": "OTP sent successfully", "req_id": req_id}
 
 @app.post("/api/auth/verify-otp-signup", response_model=AuthResponse)
 def verify_otp_signup(body: VerifySignupRequest):
     phone = body.phone_number.strip()
+    clean_phone = normalize_phone(phone)
     otp = body.otp.strip() if body.otp else None
     access_token = body.access_token.strip() if body.access_token else None
+    req_id = body.req_id.strip() if body.req_id else None
 
     if not body.name.strip():
         raise HTTPException(status_code=400, detail="Name is required")
@@ -478,16 +528,19 @@ def verify_otp_signup(body: VerifySignupRequest):
     if access_token:
         is_valid = verify_msg91_widget_access_token(access_token)
     elif otp:
-        is_valid = verify_msg91_otp(phone, otp)
+        is_valid = verify_msg91_otp(clean_phone, otp, req_id)
 
     if not is_valid:
         raise HTTPException(status_code=400, detail="Invalid or expired OTP")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     conn.row_factory = sqlite3.Row
 
     # 2. Check if phone number already exists
-    existing = conn.execute("SELECT id FROM users WHERE phone_number = ?", (phone,)).fetchone()
+    existing = conn.execute(
+        "SELECT id FROM users WHERE phone_number = ? OR phone_number = ?", 
+        (phone, clean_phone)
+    ).fetchone()
     if existing:
         conn.close()
         raise HTTPException(status_code=400, detail="An account with this phone number already exists. Please log in instead.")
@@ -500,7 +553,7 @@ def verify_otp_signup(body: VerifySignupRequest):
     conn.execute(
         """INSERT INTO users (id, name, age, email, phone_number, phone_verified, created_at)
            VALUES (?, ?, ?, ?, ?, 1, ?)""",
-        (user_id, body.name.strip(), body.age, clean_email, phone, now_iso),
+        (user_id, body.name.strip(), body.age, clean_email, clean_phone, now_iso),
     )
     conn.commit()
     conn.close()
@@ -510,38 +563,43 @@ def verify_otp_signup(body: VerifySignupRequest):
         "name": body.name.strip(),
         "age": body.age,
         "email": clean_email,
-        "phone_number": phone,
+        "phone_number": clean_phone,
         "created_at": now_iso,
     }
-    token = create_access_token(user_id, phone)
+    token = create_access_token(user_id, clean_phone)
     return {"token": token, "user": user_payload}
 
 @app.post("/api/auth/verify-otp-login", response_model=AuthResponse)
 def verify_otp_login(body: VerifyLoginRequest):
     phone = body.phone_number.strip()
+    clean_phone = normalize_phone(phone)
     otp = body.otp.strip() if body.otp else None
     access_token = body.access_token.strip() if body.access_token else None
+    req_id = body.req_id.strip() if body.req_id else None
 
     # 1. Verify Access Token or OTP with MSG91
     is_valid = False
     if access_token:
         is_valid = verify_msg91_widget_access_token(access_token)
     elif otp:
-        is_valid = verify_msg91_otp(phone, otp)
+        is_valid = verify_msg91_otp(clean_phone, otp, req_id)
 
     if not is_valid:
         raise HTTPException(status_code=400, detail="Invalid or expired OTP")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     conn.row_factory = sqlite3.Row
-    user_row = conn.execute("SELECT * FROM users WHERE phone_number = ?", (phone,)).fetchone()
+    user_row = conn.execute(
+        "SELECT * FROM users WHERE phone_number = ? OR phone_number = ?", 
+        (phone, clean_phone)
+    ).fetchone()
     conn.close()
 
     if not user_row:
         raise HTTPException(status_code=404, detail="No account found with this phone number. Please sign up.")
 
     user_dict = dict(user_row)
-    token = create_access_token(user_dict["id"], phone)
+    token = create_access_token(user_dict["id"], user_dict["phone_number"])
     return {"token": token, "user": user_dict}
 
 @app.post("/api/auth/google", response_model=AuthResponse)
@@ -553,7 +611,7 @@ def google_auth(body: GoogleAuthRequest):
     if "@" not in email:
         raise HTTPException(status_code=400, detail="Invalid Google authentication credential")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     conn.row_factory = sqlite3.Row
     user_row = conn.execute("SELECT * FROM users WHERE email = ? OR google_id = ?", (email, email)).fetchone()
 
@@ -595,7 +653,7 @@ def recent_announcements(
     limit: int = Query(default=5, ge=1, le=100),
     current_user: dict = Depends(get_current_user),
 ):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT * FROM announcements ORDER BY news_dt DESC LIMIT ?",
