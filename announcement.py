@@ -35,9 +35,7 @@ HEADERS = {
 # ── Database ────────────────────────────────────────────────────────────────────
 
 def init_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
+    conn = sqlite3.connect(DB_PATH)
 
     # Migrate from old schema if needed (drop old table, recreate with new columns)
     cursor = conn.execute("PRAGMA table_info(announcements)")
