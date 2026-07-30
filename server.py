@@ -3,6 +3,7 @@ BSE Announcements & Equity API server with User Authentication.
 """
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -18,33 +19,62 @@ from fastapi import FastAPI, HTTPException, Query, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_auth_requests
 
 from announcement import update
 from get_business_standard_response import build_reports_payload
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from this file's directory, not the process's cwd — the server must
+# start the same way regardless of where uvicorn is invoked from.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("sodhani.auth")
+
+def _mask_phone(phone: str | None) -> str:
+    if not phone or len(phone) < 4:
+        return "***"
+    return f"***{phone[-4:]}"
 
 # ── Security & Auth Config ────────────────────────────────────────────────────────
-JWT_SECRET = os.environ.get("JWT_SECRET", "sodhani-safeedge-jwt-secret-key-2026")
+# No fallback value: an app-wide signing secret must never have a public default.
+# Raised as a clear message because uvicorn reports any import-time failure as an
+# opaque 'Could not import module "server"'.
+JWT_SECRET = os.environ.get("JWT_SECRET")
+if not JWT_SECRET:
+    raise RuntimeError(
+        "JWT_SECRET is not set. Add it to sodhani-server/.env (local) or the "
+        "deployment's environment variables. Generate one with: "
+        "python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24 * 7  # 7 days
 
 MSG91_AUTH_KEY = os.environ.get("MSG91_AUTH_KEY", "")
 MSG91_TEMPLATE_ID = os.environ.get("MSG91_TEMPLATE_ID", "")
 
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+
+def _google_client_id_configured() -> bool:
+    return bool(GOOGLE_CLIENT_ID) and "your_google_client_id_here" not in GOOGLE_CLIENT_ID
+
 security_scheme = HTTPBearer(auto_error=False)
 
-def create_access_token(user_id: str, identifier: str) -> str:
+def create_access_token(user_id: str, identifier: str, token_version: int = 1) -> str:
     expires = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS)
     payload = {
         "sub": user_id,
         "identifier": identifier,
+        "tv": token_version,
         "exp": expires
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+_USER_FIELDS = "id, name, age, email, phone_number, created_at"
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security_scheme)) -> dict:
     if not credentials or not credentials.credentials:
@@ -65,11 +95,19 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
             )
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT id, name, age, email, phone_number, created_at FROM users WHERE id = ?", (user_id,)).fetchone()
+        row = conn.execute(f"SELECT {_USER_FIELDS}, token_version FROM users WHERE id = ?", (user_id,)).fetchone()
         conn.close()
         if not row:
             raise HTTPException(status_code=401, detail="User not found")
-        return dict(row)
+        if payload.get("tv") != row["token_version"]:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been revoked, please log in again",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        user = dict(row)
+        del user["token_version"]
+        return user
     except jwt.PyJWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -88,9 +126,13 @@ def get_optional_user(credentials: HTTPAuthorizationCredentials = Depends(securi
             return None
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT id, name, age, email, phone_number, created_at FROM users WHERE id = ?", (user_id,)).fetchone()
+        row = conn.execute(f"SELECT {_USER_FIELDS}, token_version FROM users WHERE id = ?", (user_id,)).fetchone()
         conn.close()
-        return dict(row) if row else None
+        if not row or payload.get("tv") != row["token_version"]:
+            return None
+        user = dict(row)
+        del user["token_version"]
+        return user
     except jwt.PyJWTError:
         return None
 
@@ -143,9 +185,40 @@ def init_db() -> None:
 
     # Users Table Schema Migration
     cursor_user = conn.execute("PRAGMA table_info(users)")
-    user_cols = {row[1] for row in cursor_user.fetchall()}
-    if user_cols and "phone_number" not in user_cols:
+    user_col_rows = cursor_user.fetchall()  # (cid, name, type, notnull, dflt_value, pk)
+    user_cols = {row[1] for row in user_col_rows}
+    phone_is_not_null = any(row[1] == "phone_number" and row[3] == 1 for row in user_col_rows)
+    needs_token_version = bool(user_cols) and "token_version" not in user_cols
+
+    if user_col_rows and (phone_is_not_null or needs_token_version):
+        # SQLite has no ALTER COLUMN — rebuild the table to relax phone_number's
+        # NOT NULL (Google-only accounts have no real phone number) and add
+        # token_version (bumped on logout to revoke outstanding JWTs), preserving
+        # existing rows.
+        conn.execute("""
+            CREATE TABLE users_new (
+                id             TEXT PRIMARY KEY,
+                name           TEXT NOT NULL,
+                age            INTEGER,
+                email          TEXT UNIQUE,
+                phone_number   TEXT UNIQUE,
+                phone_verified INTEGER DEFAULT 1,
+                google_id      TEXT UNIQUE,
+                token_version  INTEGER NOT NULL DEFAULT 1,
+                created_at     TEXT NOT NULL
+            )
+        """)
+        token_version_select = "token_version" if "token_version" in user_cols else "1"
+        conn.execute(f"""
+            INSERT INTO users_new (id, name, age, email, phone_number, phone_verified, google_id, token_version, created_at)
+            SELECT id, name, age, email, NULLIF(phone_number, ''), phone_verified, google_id, {token_version_select}, created_at
+            FROM users
+        """)
+        # Old rows used a synthetic "google_<uuid>" placeholder since phone_number
+        # was NOT NULL; now that it's nullable, drop the placeholder.
+        conn.execute("UPDATE users_new SET phone_number = NULL WHERE phone_number LIKE 'google\\_%' ESCAPE '\\'")
         conn.execute("DROP TABLE users")
+        conn.execute("ALTER TABLE users_new RENAME TO users")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -153,9 +226,10 @@ def init_db() -> None:
             name           TEXT NOT NULL,
             age            INTEGER,
             email          TEXT UNIQUE,
-            phone_number   TEXT UNIQUE NOT NULL,
+            phone_number   TEXT UNIQUE,
             phone_verified INTEGER DEFAULT 1,
             google_id      TEXT UNIQUE,
+            token_version  INTEGER NOT NULL DEFAULT 1,
             created_at     TEXT NOT NULL
         )
     """)
@@ -181,10 +255,10 @@ def send_msg91_otp(mobile: str) -> tuple[bool, str | None, str | None]:
     widget_id = os.environ.get("MSG91_WIDGET_ID") or MSG91_TEMPLATE_ID
     token_auth = os.environ.get("MSG91_TOKEN_AUTH") or MSG91_AUTH_KEY
 
-    print(f"[MSG91 Widget Debug] Sending OTP to {clean_mobile} using WidgetID '{widget_id}'")
+    logger.debug("Sending OTP to %s using WidgetID '%s'", _mask_phone(clean_mobile), widget_id)
 
     if not token_auth or not widget_id:
-        print("[MSG91 Error] Missing MSG91_WIDGET_ID or MSG91_TOKEN_AUTH in .env!")
+        logger.error("Missing MSG91_WIDGET_ID or MSG91_TOKEN_AUTH in .env!")
         return False, None, "MSG91 credentials missing in server .env file."
 
     # Call MSG91 Widget sendOtp API
@@ -203,32 +277,31 @@ def send_msg91_otp(mobile: str) -> tuple[bool, str | None, str | None]:
     try:
         with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read().decode())
-            print(f"[MSG91 Widget Response] {data}")
+            logger.debug("MSG91 Widget send response: type=%s status=%s", data.get("type"), data.get("status"))
             if data.get("type") == "success" or data.get("status") == "success":
                 req_id = data.get("message") if isinstance(data.get("message"), str) else None
                 if req_id:
                     _otp_req_ids[clean_mobile] = req_id
                 return True, req_id, None
-            
+
             err_msg = data.get("message") or "Failed to send OTP"
             if err_msg == "Invalid Captcha Token.":
-                print("[MSG91 ACTION REQUIRED] Please turn Captcha OFF in MSG91 Dashboard -> OTP -> Widgets -> Widget Settings!")
+                logger.warning("MSG91 ACTION REQUIRED: turn Captcha OFF in MSG91 Dashboard -> OTP -> Widgets -> Widget Settings")
                 err_msg = "MSG91 Widget Captcha is enabled. Turn Captcha OFF in MSG91 Widget Settings."
             elif data.get("code") == "408" or err_msg == "IPBlocked":
-                print("[MSG91 ACTION REQUIRED] MSG91 blocked this IP! Disable IP Restriction or whitelist your IP in MSG91 Dashboard.")
+                logger.warning("MSG91 ACTION REQUIRED: MSG91 blocked this IP, disable IP Restriction or whitelist server IP")
                 err_msg = "MSG91 IP Restriction active. Please whitelist server IP in MSG91 Dashboard."
             return False, None, err_msg
     except urllib.error.HTTPError as e:
-        err_body = e.read().decode()
-        print(f"[MSG91 Widget HTTP Error {e.code}] {err_body}")
+        logger.error("MSG91 Widget send HTTP error %s", e.code)
         return False, None, f"HTTP {e.code}: Failed to send OTP"
     except Exception as e:
-        print(f"[MSG91 Widget Error] {e}")
+        logger.error("MSG91 Widget send error: %s", e)
         return False, None, str(e)
 
 def verify_msg91_widget_access_token(access_token: str) -> bool:
     if not MSG91_AUTH_KEY:
-        print("[MSG91 Error] Missing MSG91_AUTH_KEY in .env!")
+        logger.error("Missing MSG91_AUTH_KEY in .env!")
         return False
 
     url = "https://control.msg91.com/api/v5/widget/verifyAccessToken"
@@ -245,14 +318,13 @@ def verify_msg91_widget_access_token(access_token: str) -> bool:
     try:
         with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read().decode())
-            print(f"[MSG91 verifyAccessToken Response] {data}")
+            logger.debug("MSG91 verifyAccessToken response: type=%s status=%s", data.get("type"), data.get("status"))
             return data.get("type") == "success" or data.get("status") == "success"
     except urllib.error.HTTPError as e:
-        err_body = e.read().decode()
-        print(f"[MSG91 verifyAccessToken HTTP Error {e.code}] {err_body}")
+        logger.error("MSG91 verifyAccessToken HTTP error %s", e.code)
         return False
     except Exception as e:
-        print(f"[MSG91 verifyAccessToken Error] {e}")
+        logger.error("MSG91 verifyAccessToken error: %s", e)
         return False
 
 def verify_msg91_otp(mobile: str, otp: str, req_id: str | None = None) -> bool:
@@ -263,7 +335,7 @@ def verify_msg91_otp(mobile: str, otp: str, req_id: str | None = None) -> bool:
     auth_key = MSG91_AUTH_KEY or token_auth
 
     if not auth_key and not (widget_id and token_auth):
-        print("[MSG91 Error] No Auth Key or Widget credentials configured in .env!")
+        logger.error("No Auth Key or Widget credentials configured in .env!")
         return False
 
     active_req_id = req_id or _otp_req_ids.get(clean_mobile)
@@ -290,7 +362,7 @@ def verify_msg91_otp(mobile: str, otp: str, req_id: str | None = None) -> bool:
         try:
             with urllib.request.urlopen(req) as resp:
                 data = json.loads(resp.read().decode())
-                print(f"[MSG91 Widget Verify Response] {data}")
+                logger.debug("MSG91 Widget verify response: type=%s status=%s code=%s", data.get("type"), data.get("status"), data.get("code"))
                 msg_str = str(data.get("message", "")).lower()
                 is_success = (
                     data.get("type") == "success"
@@ -303,10 +375,9 @@ def verify_msg91_otp(mobile: str, otp: str, req_id: str | None = None) -> bool:
                 if is_success:
                     return True
         except urllib.error.HTTPError as e:
-            err_body = e.read().decode()
-            print(f"[MSG91 Widget Verify HTTP Error {e.code}] {err_body}")
+            logger.error("MSG91 Widget verify HTTP error %s", e.code)
         except Exception as e:
-            print(f"[MSG91 Widget Verify Error] {e}")
+            logger.error("MSG91 Widget verify error: %s", e)
 
     # 2. Fallback to Standard OTP Verify API
     url = f"https://control.msg91.com/api/v5/otp/verify?otp={otp}&mobile={clean_mobile}"
@@ -314,7 +385,7 @@ def verify_msg91_otp(mobile: str, otp: str, req_id: str | None = None) -> bool:
     try:
         with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read().decode())
-            print(f"[MSG91 Verify Response] {data}")
+            logger.debug("MSG91 verify response: type=%s status=%s code=%s", data.get("type"), data.get("status"), data.get("code"))
             msg_str = str(data.get("message", "")).lower()
             is_success = (
                 data.get("type") == "success"
@@ -326,11 +397,10 @@ def verify_msg91_otp(mobile: str, otp: str, req_id: str | None = None) -> bool:
             )
             return is_success
     except urllib.error.HTTPError as e:
-        err_body = e.read().decode()
-        print(f"[MSG91 Verify HTTP Error {e.code}] {err_body}")
+        logger.error("MSG91 verify HTTP error %s", e.code)
         return False
     except Exception as e:
-        print(f"[MSG91 Verify Error] {e}")
+        logger.error("MSG91 verify error: %s", e)
         return False
 
 # ── Scheduler ────────────────────────────────────────────────────────────────────
@@ -370,21 +440,28 @@ def on_startup():
 def on_shutdown():
     scheduler.shutdown()
 
-frontend_url = os.environ.get("FRONTEND_URL", "").strip()
+# Local dev origins are always trusted; production frontend origin(s) come from
+# FRONTEND_URL (comma-separated for multiple). No wildcard fallback — an unset
+# FRONTEND_URL in production should mean "no extra origins", not "trust everyone".
 allowed_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
     "http://localhost:8000",
     "http://127.0.0.1:8000",
 ]
-if frontend_url:
-    allowed_origins.append(frontend_url)
-    if frontend_url.endswith("/"):
-        allowed_origins.append(frontend_url[:-1])
+for origin in os.environ.get("FRONTEND_URL", "").split(","):
+    origin = origin.strip()
+    if not origin:
+        continue
+    allowed_origins.append(origin)
+    if origin.endswith("/"):
+        allowed_origins.append(origin[:-1])
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins if frontend_url else ["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -402,8 +479,8 @@ class VerifySignupRequest(BaseModel):
     access_token: str | None = None
     req_id: str | None = None
     name: str
-    age: int
-    email: str | None = None
+    age: int = Field(gt=0, lt=150)
+    email: EmailStr | None = None
 
 class VerifyLoginRequest(BaseModel):
     phone_number: str
@@ -413,7 +490,7 @@ class VerifyLoginRequest(BaseModel):
 
 class GoogleAuthRequest(BaseModel):
     credential: str
-    email: str | None = None
+    email: EmailStr | None = None
     name: str | None = None
 
 class AuthResponse(BaseModel):
@@ -476,39 +553,33 @@ def health():
 
 @app.post("/api/auth/send-otp")
 def send_otp(body: SendOtpRequest):
+    # Account existence is intentionally NOT checked here — doing so before
+    # sending an OTP lets an unauthenticated caller enumerate which phone
+    # numbers have accounts. That decision is deferred to verify-otp-signup /
+    # verify-otp-login, where it takes a real completed OTP to reach.
     phone = body.phone_number.strip()
-    flow = body.flow.strip().lower() if body.flow else "any"
 
     if not phone or len(phone) < 10:
         raise HTTPException(status_code=400, detail="Please enter a valid phone number")
 
     clean_phone = normalize_phone(phone)
 
-    # Check database before sending OTP to save SMS costs and provide instant feedback
-    conn = get_db_connection()
-    conn.row_factory = sqlite3.Row
-    existing = conn.execute(
-        "SELECT id FROM users WHERE phone_number = ? OR phone_number = ?", 
-        (phone, clean_phone)
-    ).fetchone()
-    conn.close()
-
-    if flow == "login" and not existing:
-        raise HTTPException(
-            status_code=404,
-            detail="No account found with this phone number. Please sign up first."
-        )
-
-    if flow == "signup" and existing:
-        raise HTTPException(
-            status_code=400,
-            detail="An account with this phone number already exists. Please log in instead."
-        )
-
     success, req_id, err_msg = send_msg91_otp(clean_phone)
     if not success:
         raise HTTPException(status_code=400, detail=err_msg or "Failed to send OTP. Please check the phone number.")
     return {"message": "OTP sent successfully", "req_id": req_id}
+
+@app.post("/api/auth/check-phone")
+def check_phone(body: SendOtpRequest):
+    """Format-only pre-flight, kept for API compatibility with the client-side
+    Widget-JS OTP flow (which sends the OTP itself). Deliberately does not
+    reveal whether the phone number has an account — see send_otp()."""
+    phone = body.phone_number.strip()
+
+    if not phone or len(phone) < 10:
+        raise HTTPException(status_code=400, detail="Please enter a valid phone number")
+
+    return {"ok": True}
 
 @app.post("/api/auth/verify-otp-signup", response_model=AuthResponse)
 def verify_otp_signup(body: VerifySignupRequest):
@@ -520,8 +591,6 @@ def verify_otp_signup(body: VerifySignupRequest):
 
     if not body.name.strip():
         raise HTTPException(status_code=400, detail="Name is required")
-    if body.age <= 0:
-        raise HTTPException(status_code=400, detail="Please enter a valid age")
 
     # 1. Verify Access Token or OTP with MSG91
     is_valid = False
@@ -538,7 +607,7 @@ def verify_otp_signup(body: VerifySignupRequest):
 
     # 2. Check if phone number already exists
     existing = conn.execute(
-        "SELECT id FROM users WHERE phone_number = ? OR phone_number = ?", 
+        "SELECT id FROM users WHERE phone_number = ? OR phone_number = ?",
         (phone, clean_phone)
     ).fetchone()
     if existing:
@@ -550,12 +619,24 @@ def verify_otp_signup(body: VerifySignupRequest):
     now_iso = datetime.now(timezone.utc).isoformat()
     clean_email = body.email.strip().lower() if body.email and body.email.strip() else None
 
-    conn.execute(
-        """INSERT INTO users (id, name, age, email, phone_number, phone_verified, created_at)
-           VALUES (?, ?, ?, ?, ?, 1, ?)""",
-        (user_id, body.name.strip(), body.age, clean_email, clean_phone, now_iso),
-    )
-    conn.commit()
+    if clean_email:
+        existing_email = conn.execute(
+            "SELECT id FROM users WHERE email = ?", (clean_email,)
+        ).fetchone()
+        if existing_email:
+            conn.close()
+            raise HTTPException(status_code=400, detail="An account with this email already exists.")
+
+    try:
+        conn.execute(
+            """INSERT INTO users (id, name, age, email, phone_number, phone_verified, created_at)
+               VALUES (?, ?, ?, ?, ?, 1, ?)""",
+            (user_id, body.name.strip(), body.age, clean_email, clean_phone, now_iso),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=400, detail="An account with this phone number or email already exists.")
     conn.close()
 
     user_payload = {
@@ -599,14 +680,30 @@ def verify_otp_login(body: VerifyLoginRequest):
         raise HTTPException(status_code=404, detail="No account found with this phone number. Please sign up.")
 
     user_dict = dict(user_row)
-    token = create_access_token(user_dict["id"], user_dict["phone_number"])
+    token = create_access_token(user_dict["id"], user_dict["phone_number"], user_dict["token_version"])
+    del user_dict["token_version"]
     return {"token": token, "user": user_dict}
 
 @app.post("/api/auth/google", response_model=AuthResponse)
 def google_auth(body: GoogleAuthRequest):
-    # Parses Google Token credential or email from Google OAuth One-Tap
-    email = (body.email or body.credential).strip().lower()
-    name = body.name or email.split("@")[0].capitalize()
+    if not _google_client_id_configured():
+        raise HTTPException(
+            status_code=500,
+            detail="Google sign-in is not configured on the server (GOOGLE_CLIENT_ID missing)."
+        )
+
+    try:
+        claims = google_id_token.verify_oauth2_token(
+            body.credential, google_auth_requests.Request(), GOOGLE_CLIENT_ID
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid Google credential: {exc}") from exc
+
+    if not claims.get("email_verified", False):
+        raise HTTPException(status_code=400, detail="Google account email is not verified")
+
+    email = (claims.get("email") or body.email or "").strip().lower()
+    name = body.name or claims.get("name") or (email.split("@")[0].capitalize() if email else "User")
 
     if "@" not in email:
         raise HTTPException(status_code=400, detail="Invalid Google authentication credential")
@@ -619,32 +716,43 @@ def google_auth(body: GoogleAuthRequest):
         user_id = user_row["id"]
         user_dict = dict(user_row)
         conn.close()
+        token_version = user_dict.pop("token_version")
     else:
         user_id = str(uuid.uuid4())
         now_iso = datetime.now(timezone.utc).isoformat()
-        dummy_phone = f"google_{user_id[:8]}"
         conn.execute(
             """INSERT INTO users (id, name, age, email, phone_number, phone_verified, google_id, created_at)
-               VALUES (?, ?, ?, ?, ?, 1, ?, ?)""",
-            (user_id, name, 25, email, dummy_phone, email, now_iso),
+               VALUES (?, ?, ?, ?, NULL, 0, ?, ?)""",
+            (user_id, name, 25, email, email, now_iso),
         )
         conn.commit()
         conn.close()
+        token_version = 1
         user_dict = {
             "id": user_id,
             "name": name,
             "age": 25,
             "email": email,
-            "phone_number": dummy_phone,
+            "phone_number": None,
             "created_at": now_iso,
         }
 
-    token = create_access_token(user_id, email)
+    token = create_access_token(user_id, email, token_version)
     return {"token": token, "user": user_dict}
 
 @app.get("/api/auth/me")
 def get_me(current_user: dict = Depends(get_current_user)):
     return current_user
+
+@app.post("/api/auth/logout")
+def logout(current_user: dict = Depends(get_current_user)):
+    """Bumps token_version so the JWT just used (and any other outstanding
+    tokens for this user) fail validation in get_current_user from now on."""
+    conn = get_db_connection()
+    conn.execute("UPDATE users SET token_version = token_version + 1 WHERE id = ?", (current_user["id"],))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 # ── Protected Data Routes ────────────────────────────────────────────────────────
 
