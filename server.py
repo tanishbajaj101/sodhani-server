@@ -35,11 +35,6 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("sodhani.auth")
 
-def _mask_phone(phone: str | None) -> str:
-    if not phone or len(phone) < 4:
-        return "***"
-    return f"***{phone[-4:]}"
-
 # ── Security & Auth Config ────────────────────────────────────────────────────────
 # No fallback value: an app-wide signing secret must never have a public default.
 # Raised as a clear message because uvicorn reports any import-time failure as an
@@ -55,7 +50,6 @@ JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24 * 7  # 7 days
 
 MSG91_AUTH_KEY = os.environ.get("MSG91_AUTH_KEY", "")
-MSG91_TEMPLATE_ID = os.environ.get("MSG91_TEMPLATE_ID", "")
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
@@ -239,65 +233,17 @@ def init_db() -> None:
     conn.commit()
     conn.close()
 
-# ── MSG91 REST & Widget API Helpers ────────────────────────────────────────────
-
-_otp_req_ids: dict[str, str] = {}
+# ── MSG91 Widget Access-Token Verification ──────────────────────────────────────
+# The client-side widget (sodhani-web) sends and verifies the OTP itself via
+# MSG91's JS SDK. This is the one server-side check left: confirming the
+# resulting access token is genuine before trusting it as proof of phone
+# ownership, since a client-supplied token can't otherwise be trusted.
 
 def normalize_phone(phone: str) -> str:
     clean = re.sub(r"\D", "", phone or "")
     if len(clean) == 10:
         return "91" + clean
     return clean
-
-def send_msg91_otp(mobile: str) -> tuple[bool, str | None, str | None]:
-    clean_mobile = normalize_phone(mobile)
-
-    widget_id = os.environ.get("MSG91_WIDGET_ID") or MSG91_TEMPLATE_ID
-    token_auth = os.environ.get("MSG91_TOKEN_AUTH") or MSG91_AUTH_KEY
-
-    logger.debug("Sending OTP to %s using WidgetID '%s'", _mask_phone(clean_mobile), widget_id)
-
-    if not token_auth or not widget_id:
-        logger.error("Missing MSG91_WIDGET_ID or MSG91_TOKEN_AUTH in .env!")
-        return False, None, "MSG91 credentials missing in server .env file."
-
-    # Call MSG91 Widget sendOtp API
-    url = "https://control.msg91.com/api/v5/widget/sendOtp"
-    payload = json.dumps({
-        "widgetId": widget_id,
-        "tokenAuth": token_auth,
-        "identifier": clean_mobile
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json", "accept": "application/json"},
-        method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode())
-            logger.debug("MSG91 Widget send response: type=%s status=%s", data.get("type"), data.get("status"))
-            if data.get("type") == "success" or data.get("status") == "success":
-                req_id = data.get("message") if isinstance(data.get("message"), str) else None
-                if req_id:
-                    _otp_req_ids[clean_mobile] = req_id
-                return True, req_id, None
-
-            err_msg = data.get("message") or "Failed to send OTP"
-            if err_msg == "Invalid Captcha Token.":
-                logger.warning("MSG91 ACTION REQUIRED: turn Captcha OFF in MSG91 Dashboard -> OTP -> Widgets -> Widget Settings")
-                err_msg = "MSG91 Widget Captcha is enabled. Turn Captcha OFF in MSG91 Widget Settings."
-            elif data.get("code") == "408" or err_msg == "IPBlocked":
-                logger.warning("MSG91 ACTION REQUIRED: MSG91 blocked this IP, disable IP Restriction or whitelist server IP")
-                err_msg = "MSG91 IP Restriction active. Please whitelist server IP in MSG91 Dashboard."
-            return False, None, err_msg
-    except urllib.error.HTTPError as e:
-        logger.error("MSG91 Widget send HTTP error %s", e.code)
-        return False, None, f"HTTP {e.code}: Failed to send OTP"
-    except Exception as e:
-        logger.error("MSG91 Widget send error: %s", e)
-        return False, None, str(e)
 
 def verify_msg91_widget_access_token(access_token: str) -> bool:
     if not MSG91_AUTH_KEY:
@@ -325,82 +271,6 @@ def verify_msg91_widget_access_token(access_token: str) -> bool:
         return False
     except Exception as e:
         logger.error("MSG91 verifyAccessToken error: %s", e)
-        return False
-
-def verify_msg91_otp(mobile: str, otp: str, req_id: str | None = None) -> bool:
-    clean_mobile = normalize_phone(mobile)
-
-    widget_id = os.environ.get("MSG91_WIDGET_ID") or MSG91_TEMPLATE_ID
-    token_auth = os.environ.get("MSG91_TOKEN_AUTH") or MSG91_AUTH_KEY
-    auth_key = MSG91_AUTH_KEY or token_auth
-
-    if not auth_key and not (widget_id and token_auth):
-        logger.error("No Auth Key or Widget credentials configured in .env!")
-        return False
-
-    active_req_id = req_id or _otp_req_ids.get(clean_mobile)
-
-    # 1. Try Widget Verify API with reqId
-    if widget_id and token_auth:
-        url = "https://control.msg91.com/api/v5/widget/verifyOtp"
-        body_dict = {
-            "widgetId": widget_id,
-            "tokenAuth": token_auth,
-            "identifier": clean_mobile,
-            "otp": otp
-        }
-        if active_req_id:
-            body_dict["reqId"] = active_req_id
-
-        payload = json.dumps(body_dict).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json", "accept": "application/json"},
-            method="POST"
-        )
-        try:
-            with urllib.request.urlopen(req) as resp:
-                data = json.loads(resp.read().decode())
-                logger.debug("MSG91 Widget verify response: type=%s status=%s code=%s", data.get("type"), data.get("status"), data.get("code"))
-                msg_str = str(data.get("message", "")).lower()
-                is_success = (
-                    data.get("type") == "success"
-                    or data.get("status") == "success"
-                    or "success" in msg_str
-                    or "already verif" in msg_str
-                    or data.get("code") == 703
-                    or str(data.get("code")) == "703"
-                )
-                if is_success:
-                    return True
-        except urllib.error.HTTPError as e:
-            logger.error("MSG91 Widget verify HTTP error %s", e.code)
-        except Exception as e:
-            logger.error("MSG91 Widget verify error: %s", e)
-
-    # 2. Fallback to Standard OTP Verify API
-    url = f"https://control.msg91.com/api/v5/otp/verify?otp={otp}&mobile={clean_mobile}"
-    req = urllib.request.Request(url, headers={"authkey": auth_key, "accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode())
-            logger.debug("MSG91 verify response: type=%s status=%s code=%s", data.get("type"), data.get("status"), data.get("code"))
-            msg_str = str(data.get("message", "")).lower()
-            is_success = (
-                data.get("type") == "success"
-                or data.get("status") == "success"
-                or "success" in msg_str
-                or "already verif" in msg_str
-                or data.get("code") == 703
-                or str(data.get("code")) == "703"
-            )
-            return is_success
-    except urllib.error.HTTPError as e:
-        logger.error("MSG91 verify HTTP error %s", e.code)
-        return False
-    except Exception as e:
-        logger.error("MSG91 verify error: %s", e)
         return False
 
 # ── Scheduler ────────────────────────────────────────────────────────────────────
@@ -475,18 +345,14 @@ class SendOtpRequest(BaseModel):
 
 class VerifySignupRequest(BaseModel):
     phone_number: str
-    otp: str | None = None
-    access_token: str | None = None
-    req_id: str | None = None
+    access_token: str
     name: str
     age: int = Field(gt=0, lt=150)
     email: EmailStr | None = None
 
 class VerifyLoginRequest(BaseModel):
     phone_number: str
-    otp: str | None = None
-    access_token: str | None = None
-    req_id: str | None = None
+    access_token: str
 
 class GoogleAuthRequest(BaseModel):
     credential: str
@@ -551,29 +417,13 @@ def _get_research_reports(days: int) -> dict:
 def health():
     return {"status": "ok"}
 
-@app.post("/api/auth/send-otp")
-def send_otp(body: SendOtpRequest):
-    # Account existence is intentionally NOT checked here — doing so before
-    # sending an OTP lets an unauthenticated caller enumerate which phone
-    # numbers have accounts. That decision is deferred to verify-otp-signup /
-    # verify-otp-login, where it takes a real completed OTP to reach.
-    phone = body.phone_number.strip()
-
-    if not phone or len(phone) < 10:
-        raise HTTPException(status_code=400, detail="Please enter a valid phone number")
-
-    clean_phone = normalize_phone(phone)
-
-    success, req_id, err_msg = send_msg91_otp(clean_phone)
-    if not success:
-        raise HTTPException(status_code=400, detail=err_msg or "Failed to send OTP. Please check the phone number.")
-    return {"message": "OTP sent successfully", "req_id": req_id}
-
 @app.post("/api/auth/check-phone")
 def check_phone(body: SendOtpRequest):
     """Format-only pre-flight, kept for API compatibility with the client-side
-    Widget-JS OTP flow (which sends the OTP itself). Deliberately does not
-    reveal whether the phone number has an account — see send_otp()."""
+    Widget-JS OTP flow (which sends and verifies the OTP itself). Deliberately
+    does not reveal whether the phone number has an account — that check is
+    deferred to verify-otp-signup / verify-otp-login, where it takes a real
+    completed OTP to reach."""
     phone = body.phone_number.strip()
 
     if not phone or len(phone) < 10:
@@ -585,27 +435,17 @@ def check_phone(body: SendOtpRequest):
 def verify_otp_signup(body: VerifySignupRequest):
     phone = body.phone_number.strip()
     clean_phone = normalize_phone(phone)
-    otp = body.otp.strip() if body.otp else None
-    access_token = body.access_token.strip() if body.access_token else None
-    req_id = body.req_id.strip() if body.req_id else None
+    access_token = body.access_token.strip()
 
     if not body.name.strip():
         raise HTTPException(status_code=400, detail="Name is required")
 
-    # 1. Verify Access Token or OTP with MSG91
-    is_valid = False
-    if access_token:
-        is_valid = verify_msg91_widget_access_token(access_token)
-    elif otp:
-        is_valid = verify_msg91_otp(clean_phone, otp, req_id)
-
-    if not is_valid:
+    if not access_token or not verify_msg91_widget_access_token(access_token):
         raise HTTPException(status_code=400, detail="Invalid or expired OTP")
 
     conn = get_db_connection()
     conn.row_factory = sqlite3.Row
 
-    # 2. Check if phone number already exists
     existing = conn.execute(
         "SELECT id FROM users WHERE phone_number = ? OR phone_number = ?",
         (phone, clean_phone)
@@ -614,7 +454,6 @@ def verify_otp_signup(body: VerifySignupRequest):
         conn.close()
         raise HTTPException(status_code=400, detail="An account with this phone number already exists. Please log in instead.")
 
-    # 3. Create User
     user_id = str(uuid.uuid4())
     now_iso = datetime.now(timezone.utc).isoformat()
     clean_email = body.email.strip().lower() if body.email and body.email.strip() else None
@@ -654,18 +493,9 @@ def verify_otp_signup(body: VerifySignupRequest):
 def verify_otp_login(body: VerifyLoginRequest):
     phone = body.phone_number.strip()
     clean_phone = normalize_phone(phone)
-    otp = body.otp.strip() if body.otp else None
-    access_token = body.access_token.strip() if body.access_token else None
-    req_id = body.req_id.strip() if body.req_id else None
+    access_token = body.access_token.strip()
 
-    # 1. Verify Access Token or OTP with MSG91
-    is_valid = False
-    if access_token:
-        is_valid = verify_msg91_widget_access_token(access_token)
-    elif otp:
-        is_valid = verify_msg91_otp(clean_phone, otp, req_id)
-
-    if not is_valid:
+    if not access_token or not verify_msg91_widget_access_token(access_token):
         raise HTTPException(status_code=400, detail="Invalid or expired OTP")
 
     conn = get_db_connection()
